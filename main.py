@@ -1,0 +1,711 @@
+import logging
+import asyncio
+import os
+from dotenv import load_dotenv
+
+# Загрузка переменных окружения
+load_dotenv()
+import sqlite3
+import glob
+import re
+import subprocess
+from datetime import datetime
+from aiogram import Bot, Dispatcher, exceptions
+from aiogram.types import FSInputFile, Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, URLInputFile
+from aiogram.filters import Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import yt_dlp
+import math
+import requests
+from bs4 import BeautifulSoup
+import json
+
+# --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003334578127"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "723550550"))  # Ваш ID для управления ссылками
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
+DELAY_BETWEEN_UPLOADS = int(os.getenv("DELAY_BETWEEN_UPLOADS", "20"))
+MAX_FILE_SIZE_MB = 49  # Лимит телеграма для ботов (оставляем запас 1 МБ)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- БАЗА ДАННЫХ ---
+def init_db():
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS sent_videos (
+            video_id TEXT PRIMARY KEY,
+            account_url TEXT
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS tiktok_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS failed_videos (
+            video_id TEXT PRIMARY KEY,
+            fail_count INTEGER DEFAULT 1,
+            last_fail_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def is_video_sent(video_id):
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT video_id FROM sent_videos WHERE video_id = ?", (video_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_video_sent(video_id, account_url):
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO sent_videos (video_id, account_url) VALUES (?, ?)", (video_id, account_url))
+    conn.commit()
+    conn.close()
+
+def get_all_accounts():
+    """Получить все аккаунты из базы"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT url FROM tiktok_accounts")
+    accounts = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return accounts
+
+def get_stats():
+    """Получить статистику базы данных"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM tiktok_accounts")
+    total_accounts = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(*) FROM sent_videos")
+    total_sent = cursor.fetchone()[0]
+    conn.close()
+    return total_accounts, total_sent
+
+def add_account(url):
+    """Добавить новый аккаунт"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO tiktok_accounts (url) VALUES (?)", (url,))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+def delete_account(url):
+    """Удалить аккаунт"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM tiktok_accounts WHERE url = ?", (url,))
+    conn.commit()
+    affected = cursor.rowcount
+    conn.close()
+    return affected > 0
+
+def is_video_failed(video_id):
+    """Проверить слишком ли много попыток скачать видео"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT fail_count FROM failed_videos WHERE video_id = ?", (video_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result and result[0] >= 3  # Пропускаем видео после 3 неудачных попыток
+
+def mark_video_failed(video_id):
+    """Отметить видео как не скачиваемое"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO failed_videos (video_id, fail_count) 
+        VALUES (?, 1)
+        ON CONFLICT(video_id) DO UPDATE SET 
+            fail_count = fail_count + 1,
+            last_fail_time = CURRENT_TIMESTAMP
+    """, (video_id,))
+    conn.commit()
+    conn.close()
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+def clean_hashtags(text):
+    if not text:
+        return ""
+    text = re.sub(r'#\S+', '', text).strip()
+    return re.sub(r'\n\s*\n', '\n', text)
+
+def format_timestamp(timestamp, date_str):
+    if timestamp:
+        try:
+            dt = datetime.fromtimestamp(timestamp)
+            return dt.strftime("%d.%m.%Y")
+        except:
+            pass
+    if date_str and len(date_str) == 8:
+        return f"{date_str[6:8]}.{date_str[4:6]}.{date_str[0:4]}"
+    return datetime.now().strftime("%d.%m.%Y")
+
+def cleanup_files(video_id):
+    files = glob.glob(f"{video_id}*")
+    for f in files:
+        try:
+            os.remove(f)
+        except Exception as e:
+            logger.error(f"Не удалось удалить {f}: {e}")
+
+def get_video_dimensions(file_path):
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'csv=p=0', file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            w, h = result.stdout.strip().split(',')
+            return int(w), int(h)
+    except Exception as e:
+        logger.error(f"Ошибка получения размеров {file_path}: {e}")
+    return None, None
+
+def reprocess_video_ffmpeg(input_file, output_file):
+    """
+    Переобработка видео через ffmpeg для стандартизации формата.
+    Приводит видео к размеру 1080x1920 с умной обрезкой и/или чёрными полосами.
+    """
+    try:
+        # Сначала получаем информацию о видео
+        probe_cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=width,height',
+            '-of', 'csv=p=0', input_file
+        ]
+        
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        if probe_result.returncode == 0:
+            dimensions = probe_result.stdout.strip().split(',')
+            orig_w, orig_h = int(dimensions[0]), int(dimensions[1])
+            aspect_ratio = orig_w / orig_h if orig_h > 0 else 1
+            
+            logger.info(f"Исходное видео: {orig_w}x{orig_h}, соотношение: {aspect_ratio:.2f}")
+            
+            # Целевое соотношение 9:16 = 0.5625
+            target_ratio = 9 / 16  # 0.5625
+            
+            # Если видео слишком горизонтальное (шире чем надо), обрезаем боки
+            if aspect_ratio > 0.65:
+                logger.info("Видео слишком широкое, обрезаем боки...")
+                # Высота остаётся, ширина = высота * целевое_соотношение
+                new_w = int(orig_h * target_ratio)
+                crop_filter = f"crop={new_w}:{orig_h}:(ow-iw)/2:0"
+                scale_filter = f"{crop_filter},scale=1080:1920"
+            # Если видео слишком вертикальное (уже чем надо), добавляем полосы
+            elif aspect_ratio < 0.4:
+                logger.info("Видео слишком узкое, добавляем полосы...")
+                scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
+            # Если соотношение нормальное, просто масштабируем и добавляем полосы если нужно
+            else:
+                logger.info("Соотношение сторон в норме, добавляем полосы если нужно...")
+                scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
+        else:
+            # Если не удалось получить информацию, используем стандартный фильтр
+            logger.warning("Не удалось получить размер видео, используем стандартный фильтр")
+            scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
+        
+        # Исправление для iPhone: сбрасываем пиксельные пропорции (SAR), чтобы видео не сжималось/растягивалось
+        scale_filter += ",setsar=1"
+        
+        cmd = [
+            'ffmpeg', '-i', input_file,
+            '-vf', scale_filter,
+            '-c:v', 'libx264',
+            '-pix_fmt', 'yuv420p',
+            '-profile:v', 'main',
+            '-level', '4.2',
+            '-crf', '22',
+            '-preset', 'fast',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-movflags', 'faststart',
+            '-y',
+            output_file
+        ]
+        
+        logger.info(f"Запуск ffmpeg переобработки: {input_file} -> {output_file}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode == 0:
+            logger.info(f"✅ Видео успешно переобработано: {output_file}")
+            return True
+        else:
+            logger.error(f"❌ Ошибка ffmpeg: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Ошибка при переобработке видео: {e}")
+        return False
+
+# --- ФУНКЦИИ TIKTOK ---
+def get_tiktok_avatar(username):
+    """Пытаемся вытащить аватарку аккаунта через парсинг страницы"""
+    url = f"https://www.tiktok.com/@{username}"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.text, 'html.parser')
+        data_script = soup.find('script', id='__UNIVERSAL_DATA_FOR_REHYDRATION__')
+        
+        if data_script:
+            data = json.loads(data_script.string)
+            user_detail = data.get('__DEFAULT_SCOPE__', {}).get('webapp.user-detail', {})
+            user_info = user_detail.get('userInfo', {}).get('user', {})
+            avatar_url = user_info.get('avatarLarger') or user_info.get('avatarMedium') or user_info.get('avatarThumb')
+            return avatar_url
+    except Exception as e:
+        logger.error(f"Ошибка получения аватарки {username}: {e}")
+    return None
+
+def get_channel_videos(url):
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'ignoreerrors': True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(url, download=False)
+            if 'entries' in info:
+                return [x for x in info['entries'] if x is not None]
+        except Exception as e:
+            logger.error(f"Ошибка чтения канала {url}: {e}")
+            return []
+    return []
+
+def process_and_download(video_url, video_id):
+    cleanup_files(video_id)
+    filename_template = f"{video_id}.%(ext)s"
+    temp_file = f"{video_id}_temp.mp4"
+    final_file = f"{video_id}.mp4"
+    
+    # Скачиваем видео как есть
+    ydl_opts = {
+        'format': 'bestvideo[height<=1080]+bestaudio/best', 
+        'outtmpl': filename_template,
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'noplaylist': True,
+        'writethumbnail': False,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        try:
+            info = ydl.extract_info(video_url, download=True)
+            
+            if os.path.exists(final_file):
+                # Переименовываем в temp и переобрабатываем через ffmpeg
+                os.rename(final_file, temp_file)
+                
+                # Запускаем ffmpeg для стандартизации
+                if reprocess_video_ffmpeg(temp_file, final_file):
+                    # Удаляем временный файл если переобработка успешна
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
+                    
+                    raw_title = info.get('title', '') or info.get('description', '')
+                    clean_title = clean_hashtags(raw_title)
+                    author = info.get('uploader') or info.get('channel') or "TikTok"
+                    ts = info.get('timestamp')
+                    d_str = info.get('upload_date')
+                    final_date = format_timestamp(ts, d_str)
+                    
+                    return final_file, clean_title, final_date, author
+                else:
+                    # Если ffmpeg не сработал, пробуем отправить оригинальное видео
+                    logger.warning(f"ffmpeg не сработал, отправляем оригинальное видео {video_id}")
+                    os.rename(temp_file, final_file)
+                    
+                    raw_title = info.get('title', '') or info.get('description', '')
+                    clean_title = clean_hashtags(raw_title)
+                    author = info.get('uploader') or info.get('channel') or "TikTok"
+                    ts = info.get('timestamp')
+                    d_str = info.get('upload_date')
+                    final_date = format_timestamp(ts, d_str)
+                    
+                    return final_file, clean_title, final_date, author
+            
+        except Exception as e:
+            logger.error(f"Ошибка обработки {video_url}: {e}")
+            
+    return None, None, None, None
+
+# --- ОСНОВНОЙ ЦИКЛ ---
+async def get_main_keyboard():
+    kb = [
+        [KeyboardButton(text="➕ Добавить ссылку"), KeyboardButton(text="📋 Список")],
+        [KeyboardButton(text="📊 Статистика")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+async def handle_manage_links(message_or_callback, page: int = 0, force_new_message: bool = False):
+    """Показать кнопки для управления ссылками с пагинацией"""
+    if isinstance(message_or_callback, Message):
+        user_id = message_or_callback.from_user.id
+        event = message_or_callback
+    else:
+        user_id = message_or_callback.from_user.id
+        event = message_or_callback.message
+    
+    logger.info(f"handle_manage_links: user_id={user_id}, page={page}")
+    
+    if user_id != ADMIN_ID:
+        # Если это сообщение от самого бота (через callback.message), не ругаемся на доступ
+        # так как это внутренний вызов после успешного подтверждения админа
+        if user_id == (await message_or_callback.bot.get_me()).id:
+            logger.info("Внутренний вызов от имени бота, проверка ADMIN_ID пропущена")
+        else:
+            if isinstance(message_or_callback, Message):
+                await message_or_callback.answer("❌ Доступ запрещен.")
+            else:
+                await message_or_callback.answer("❌ Доступ запрещен.", show_alert=True)
+            return
+    
+    accounts = get_all_accounts()
+    
+    ITEMS_PER_PAGE = 10
+    total_pages = math.ceil(len(accounts) / ITEMS_PER_PAGE) if accounts else 1
+    
+    # Защита от выхода за пределы
+    if page < 0: page = 0
+    if page >= total_pages: page = total_pages - 1
+    
+    start_idx = page * ITEMS_PER_PAGE
+    end_idx = start_idx + ITEMS_PER_PAGE
+    current_accounts = accounts[start_idx:end_idx]
+    
+    keyboard = InlineKeyboardBuilder()
+    
+    if accounts:
+        for acc in current_accounts:
+            # Обрезаем ссылку для отображения
+            display_text = acc.replace("https://www.tiktok.com/@", "")
+            keyboard.button(text=f"❌ {display_text}", callback_data=f"confirm_del_{display_text}")
+        
+        # Делаем по 2 кнопки в ряд для компактности
+        keyboard.adjust(2)
+        
+        # Кнопки пагинации
+        pagination_row = []
+        if page > 0:
+            pagination_row.append(InlineKeyboardBuilder().button(text="⬅️ Назад", callback_data=f"page_{page-1}").as_markup().inline_keyboard[0][0])
+        if page < total_pages - 1:
+            pagination_row.append(InlineKeyboardBuilder().button(text="Вперед ➡️", callback_data=f"page_{page+1}").as_markup().inline_keyboard[0][0])
+            
+        if pagination_row:
+            keyboard.row(*pagination_row)
+    
+    text = f"📋 <b>Управление аккаунтами TikTok (Страница {page+1} из {total_pages})</b>\n\n"
+    if accounts:
+        text += "Нажмите на кнопку с крестиком, чтобы удалить аккаунт из отслеживания:"
+    else:
+        text += "📝 Список аккаунтов пуст."
+    
+    if isinstance(message_or_callback, Message) or force_new_message:
+        await event.answer(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+    else:
+        # Если это колбэк и не просили новое сообщение, обновляем текущее
+        await message_or_callback.message.edit_text(text, reply_markup=keyboard.as_markup(), parse_mode="HTML")
+
+async def handle_confirm_delete(callback: CallbackQuery):
+    """Показать аватарку и запросить подтверждение удаления"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
+    username = callback.data.replace("confirm_del_", "")
+    await callback.message.edit_text("⏳ Загрузка информации об аккаунте...")
+    
+    avatar_url = await asyncio.to_thread(get_tiktok_avatar, username)
+    text = f"❓ <b>Вы уверены, что хотите удалить аккаунт из отслеживания?</b>\n\n👤 <a href='https://www.tiktok.com/@{username}'>@{username}</a>"
+    
+    keyboard = InlineKeyboardBuilder()
+    keyboard.button(text="✅ Да, удалить", callback_data=f"do_del_{username}")
+    keyboard.button(text="❌ Отмена", callback_data="cancel_del")
+    keyboard.adjust(2)
+    
+    # Удаляем старое текстовое сообщение
+    await callback.message.delete()
+    
+    if avatar_url:
+        try:
+            photo = URLInputFile(avatar_url)
+            await callback.message.answer_photo(
+                photo=photo,
+                caption=text,
+                reply_markup=keyboard.as_markup(),
+                parse_mode="HTML"
+            )
+            return
+        except Exception as e:
+            logger.error(f"Не удалось отправить фото {avatar_url}: {e}")
+            
+    # Если аватарку найти не удалось или не отправилась
+    await callback.message.answer(
+        text, 
+        reply_markup=keyboard.as_markup(), 
+        parse_mode="HTML"
+    )
+
+async def handle_delete_callback(callback: CallbackQuery):
+    """Обработка окончательного удаления ссылки через кнопку"""
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("❌ Доступ запрещен.", show_alert=True)
+        return
+    
+    username = callback.data.replace("do_del_", "")
+    url = f"https://www.tiktok.com/@{username}"
+    
+    if delete_account(url):
+        await callback.answer(f"✅ Удалено: @{username}", show_alert=True)
+        logger.info(f"Удалена ссылка: {url}")
+    else:
+        await callback.answer("❌ Ошибка при удалении", show_alert=True)
+        
+    # Удаляем сообщение с фото/подтверждением
+    await callback.message.delete()
+    
+    # Возвращаемся к списку (отправляем новое сообщение, так как старое удалено)
+    await handle_manage_links(callback.message, page=0, force_new_message=True)
+
+async def handle_cancel_delete(callback: CallbackQuery):
+    """Отмена удаления"""
+    await callback.message.delete()
+    await handle_manage_links(callback.message, page=0, force_new_message=True)
+
+async def handle_add_request(message: Message):
+    """Запрос на добавление ссылки"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    await message.answer(
+        "📝 Отправьте ссылку на аккаунт TikTok в формате:\n"
+        "https://www.tiktok.com/@username"
+    )
+
+async def handle_text_input(message: Message):
+    """Обработка ввода текста"""
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    text = message.text.strip()
+    
+    if text == "➕ Добавить ссылку":
+        await handle_add_request(message)
+        return
+        
+    if text == "📋 Список":
+        await handle_manage_links(message)
+        return
+        
+    if text == "📊 Статистика":
+        total_accs, total_sent = get_stats()
+        stats_text = (
+            "📊 <b>Статистика работы бота</b>\n\n"
+            f"👥 В базе аккаунтов: <b>{total_accs}</b>\n"
+            f"🎬 Успешно отправлено видео: <b>{total_sent}</b>"
+        )
+        await message.answer(stats_text, parse_mode="HTML")
+        return
+    
+    # Пропускаем команды
+    if text.startswith('/'):
+        return
+    
+    # Проверяем формат
+    if not text.startswith('https://www.tiktok.com/@'):
+        # Если это не ссылка и не команда меню, можно игнорировать или сказать про формат
+        # Но лучше не спамить, если пользователь просто пишет что-то другое
+        return
+    
+    if add_account(text):
+        await message.answer(f"✅ Ссылка добавлена: {text}")
+        logger.info(f"Добавлена новая ссылка: {text}")
+    else:
+        await message.answer(f"⚠️ Ссылка уже существует: {text}")
+
+async def main():
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    
+    # Регистрируем обработчики для ПМ
+    @dp.message(Command("manage"))
+    async def manage_cmd(message: Message):
+        await handle_manage_links(message)
+    
+    @dp.message(Command("start"))
+    async def start_cmd(message: Message):
+        logger.info(f"Получена команда /start от {message.from_user.id}")
+        await message.answer("👋 Бот управления TikTok ссылками", reply_markup=await get_main_keyboard())
+        await handle_manage_links(message)
+    
+    @dp.callback_query(lambda c: c.data.startswith("confirm_del_"))
+    async def confirm_delete_callback(callback: CallbackQuery):
+        await handle_confirm_delete(callback)
+
+    @dp.callback_query(lambda c: c.data.startswith("do_del_"))
+    async def delete_callback(callback: CallbackQuery):
+        await handle_delete_callback(callback)
+        
+    @dp.callback_query(lambda c: c.data == "cancel_del")
+    async def cancel_delete_callback(callback: CallbackQuery):
+        await handle_cancel_delete(callback)
+        
+    @dp.callback_query(lambda c: c.data.startswith("page_"))
+    async def page_callback(callback: CallbackQuery):
+        page = int(callback.data.split("_")[1])
+        await handle_manage_links(callback, page=page)
+        await callback.answer()
+    
+    @dp.message()
+    async def text_handler(message: Message):
+        logger.info(f"Получено текстовое сообщение от {message.from_user.id}: {message.text[:50]}")
+        await handle_text_input(message)
+    
+    init_db()
+    logger.info("Бот запущен v7.4 (Shutdown Fix + UI Update)")
+    
+    # Запускаем polling и основной цикл одновременно
+    polling_task = asyncio.create_task(dp.start_polling(bot))
+    video_check_task = asyncio.create_task(check_videos(bot, dp))
+    
+    try:
+        # Ждем завершения polling (это произойдет при SIGINT/Ctrl+C)
+        await polling_task
+    finally:
+        # Отменяем задачу проверки видео
+        logger.info("Останавливаем задачу проверки видео...")
+        video_check_task.cancel()
+        try:
+            await video_check_task
+        except asyncio.CancelledError:
+            logger.info("Задача проверки видео остановлена.")
+
+async def check_videos(bot: Bot, dp: Dispatcher):
+    """Основной цикл скачивания видео"""
+    try:
+        while True:
+            accounts = await asyncio.to_thread(get_all_accounts)  # Получаем актуальный список
+            
+            for account in accounts:
+                logger.info(f"Проверяем: {account}")
+                videos = await asyncio.to_thread(get_channel_videos, account)
+                
+                if not videos:
+                    continue
+
+                videos_sorted = list(reversed(videos))
+
+                for entry in videos_sorted:
+                    video_id = entry.get('id')
+                    video_url = entry.get('url')
+
+                    if not video_id or not video_url:
+                        continue
+
+                    if is_video_sent(video_id):
+                        continue
+                    
+                    # Пропускаем видео которые не скачиваются
+                    if is_video_failed(video_id):
+                        logger.warning(f"Видео {video_id} не скачивается (более 3 попыток). Пропускаем.")
+                        continue
+
+                    logger.info(f"Обрабатываю новое видео: {video_id}")
+                    
+                    file_path, title, date_str, author = await asyncio.to_thread(process_and_download, video_url, video_id)
+                    
+                    if file_path:
+                        try:
+                            # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА (Fix HTTP 413 Error) ---
+                            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                            if file_size_mb > MAX_FILE_SIZE_MB:
+                                logger.warning(f"Файл {file_path} слишком большой ({file_size_mb:.2f} MB). Пропускаем.")
+                                cleanup_files(video_id)
+                                mark_video_sent(video_id, account) 
+                                continue
+
+                            video_input = FSInputFile(file_path)
+                            caption = (
+                                f"📅 <b>{date_str}</b>\n"
+                                f"{title}\n\n"
+                                f"👤 Канал: <b>{author}</b>\n"
+                                f"Источник: <a href='{video_url}'>Видео</a>"
+                            )
+                            
+                            # Достаем реальные размеры для корректного отображения на iOS
+                            w, h = await asyncio.to_thread(get_video_dimensions, file_path)
+                            kwargs = {}
+                            if w and h:
+                                kwargs['width'] = w
+                                kwargs['height'] = h
+                            
+                            await bot.send_video(
+                                chat_id=CHANNEL_ID, 
+                                video=video_input, 
+                                caption=caption,
+                                parse_mode="HTML",
+                                **kwargs
+                            )
+                            
+                            mark_video_sent(video_id, account)
+                            logger.info(f"Видео {video_id} отправлено.")
+                            
+                        except exceptions.TelegramRetryAfter as e:
+                            logger.warning(f"Лимит Telegram. Ждем {e.retry_after} сек.")
+                            await asyncio.sleep(e.retry_after)
+                            cleanup_files(video_id)
+                            continue 
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки: {e}")
+                        finally:
+                            cleanup_files(video_id)
+                            await asyncio.sleep(DELAY_BETWEEN_UPLOADS)
+                    else:
+                        logger.error(f"Не удалось скачать видео {video_id}. Отмечаем как неудачное.")
+                        mark_video_failed(video_id)
+                        cleanup_files(video_id)
+            
+            logger.info(f"Пауза {CHECK_INTERVAL} сек.")
+            await asyncio.sleep(CHECK_INTERVAL)
+    except asyncio.CancelledError:
+        logger.info("Цикл скачивания видео остановлен.")
+
+if __name__ == "__main__":
+    import sys
+    
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
+    
+    # Всегда выходим с кодом 1, чтобы start.sh перезапустил бота
+    # Для полной остановки используйте kill (SIGTERM)
+    logger.info("Перезапуск бота...")
+    sys.exit(1)

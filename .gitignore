@@ -1,0 +1,7 @@
+.env
+videos.db
+bot.log
+__pycache__/
+.idea/
+*.mp4
+*_temp.mp4
