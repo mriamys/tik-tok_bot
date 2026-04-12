@@ -28,7 +28,26 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
 DELAY_BETWEEN_UPLOADS = int(os.getenv("DELAY_BETWEEN_UPLOADS", "20"))
 MAX_FILE_SIZE_MB = 49  # Лимит телеграма для ботов (оставляем запас 1 МБ)
 
-logging.basicConfig(level=logging.INFO)
+from logging.handlers import RotatingFileHandler
+
+# --- ЛОГИРОВАНИЕ ---
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file = 'bot.log'
+
+# Ротация логов: 5 МБ на файл, храним до 5 старых файлов
+file_handler = RotatingFileHandler(log_file, maxBytes=5*1024*1024, backupCount=5, encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Вывод в консоль
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[file_handler, console_handler]
+)
 logger = logging.getLogger(__name__)
 
 # --- БАЗА ДАННЫХ ---
