@@ -176,6 +176,7 @@ def format_timestamp(timestamp, date_str):
     return datetime.now().strftime("%d.%m.%Y")
 
 def cleanup_files(video_id):
+    """Удаление всех временных файлов, связанных с video_id."""
     files = glob.glob(f"{video_id}*")
     for f in files:
         try:
@@ -184,6 +185,7 @@ def cleanup_files(video_id):
             logger.error(f"Не удалось удалить {f}: {e}")
 
 def get_video_dimensions(file_path):
+    """Получить реальные размеры видео через ffprobe."""
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -199,80 +201,139 @@ def get_video_dimensions(file_path):
         logger.error(f"Ошибка получения размеров {file_path}: {e}")
     return None, None
 
-def reprocess_video_ffmpeg(input_file, output_file):
+
+def generate_thumbnail(video_file, thumb_file):
     """
-    Переобработка видео через ffmpeg для стандартизации формата.
-    Приводит видео к размеру 1080x1920 с умной обрезкой и/или чёрными полосами.
+    Генерация JPEG-превью для видео (макс. 320px по длинной стороне).
+    Telegram требует thumbnail ≤ 320x320, JPEG.
+    Без thumbnail iOS-клиент часто неправильно определяет aspect ratio.
     """
     try:
-        # Сначала получаем информацию о видео
+        cmd = [
+            'ffmpeg', '-i', video_file,
+            '-ss', '00:00:01.000',
+            '-vframes', '1',
+            '-vf', 'scale=if(gt(iw\,ih)\,320\,-2):if(gt(iw\,ih)\,-2\,320)',
+            '-q:v', '3',
+            '-y',
+            thumb_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode == 0 and os.path.exists(thumb_file):
+            logger.info(f"✅ Thumbnail создан: {thumb_file}")
+            return True
+        else:
+            logger.warning(f"Не удалось создать thumbnail: {result.stderr}")
+            return False
+    except Exception as e:
+        logger.error(f"Ошибка создания thumbnail: {e}")
+        return False
+
+
+def reprocess_video_ffmpeg(input_file, output_file):
+    """
+    Переобработка видео через ffmpeg для совместимости с Telegram iOS.
+    
+    Ключевые параметры для iPhone:
+    - H.264 Baseline profile (максимальная совместимость с iOS-плеером)
+    - Level 3.1 (безопасный для всех мобильных устройств)
+    - yuv420p (единственный формат, который корректно воспроизводится везде)
+    - movflags +faststart (moov atom в начале файла для стриминга)
+    - setsar=1 + setdar (явные пропорции пикселей и дисплея)
+    """
+    try:
+        # Получаем информацию об исходном видео
         probe_cmd = [
             'ffprobe', '-v', 'error',
             '-select_streams', 'v:0',
             '-show_entries', 'stream=width,height',
             '-of', 'csv=p=0', input_file
         ]
-        
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+
+        probe_result = subprocess.run(
+            probe_cmd, capture_output=True, text=True, timeout=30
+        )
+
         if probe_result.returncode == 0:
             dimensions = probe_result.stdout.strip().split(',')
             orig_w, orig_h = int(dimensions[0]), int(dimensions[1])
             aspect_ratio = orig_w / orig_h if orig_h > 0 else 1
-            
-            logger.info(f"Исходное видео: {orig_w}x{orig_h}, соотношение: {aspect_ratio:.2f}")
-            
-            # Целевое соотношение 9:16 = 0.5625
+
+            logger.info(
+                f"Исходное видео: {orig_w}x{orig_h}, "
+                f"соотношение: {aspect_ratio:.4f}"
+            )
+
             target_ratio = 9 / 16  # 0.5625
-            
-            # Если видео слишком горизонтальное (шире чем надо), обрезаем боки
+
             if aspect_ratio > 0.65:
-                logger.info("Видео слишком широкое, обрезаем боки...")
-                # Высота остаётся, ширина = высота * целевое_соотношение
+                # Слишком широкое — обрезаем бока
+                logger.info("Видео слишком широкое, обрезаем бока")
                 new_w = int(orig_h * target_ratio)
-                crop_filter = f"crop={new_w}:{orig_h}:(ow-iw)/2:0"
-                scale_filter = f"{crop_filter},scale=1080:1920"
-            # Если видео слишком вертикальное (уже чем надо), добавляем полосы
+                # Делаем ширину чётной
+                new_w = new_w if new_w % 2 == 0 else new_w - 1
+                vf = (
+                    f"crop={new_w}:{orig_h},"
+                    f"scale=1080:1920,"
+                    f"setsar=1,setdar=9/16"
+                )
             elif aspect_ratio < 0.4:
-                logger.info("Видео слишком узкое, добавляем полосы...")
-                scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
-            # Если соотношение нормальное, просто масштабируем и добавляем полосы если нужно
+                # Слишком узкое — чёрные полосы по бокам
+                logger.info("Видео слишком узкое, добавляем полосы")
+                vf = (
+                    "scale=1080:1920:"
+                    "force_original_aspect_ratio=decrease,"
+                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    "setsar=1,setdar=9/16"
+                )
             else:
-                logger.info("Соотношение сторон в норме, добавляем полосы если нужно...")
-                scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
+                # Нормальное соотношение — масштабируем и выравниваем
+                logger.info("Соотношение сторон близко к 9:16")
+                vf = (
+                    "scale=1080:1920:"
+                    "force_original_aspect_ratio=decrease,"
+                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                    "setsar=1,setdar=9/16"
+                )
         else:
-            # Если не удалось получить информацию, используем стандартный фильтр
-            logger.warning("Не удалось получить размер видео, используем стандартный фильтр")
-            scale_filter = "scale='min(1080,ih*1080/iw)':'min(1920,iw*1920/ih)',pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black"
-        
-        # Исправление для iPhone: сбрасываем пиксельные пропорции (SAR), чтобы видео не сжималось/растягивалось
-        scale_filter += ",setsar=1"
-        
+            logger.warning(
+                "Не удалось получить размер видео, используем стандартный фильтр"
+            )
+            vf = (
+                "scale=1080:1920:"
+                "force_original_aspect_ratio=decrease,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
+                "setsar=1,setdar=9/16"
+            )
+
         cmd = [
             'ffmpeg', '-i', input_file,
-            '-vf', scale_filter,
+            '-vf', vf,
             '-c:v', 'libx264',
             '-pix_fmt', 'yuv420p',
-            '-profile:v', 'main',
-            '-level', '4.2',
-            '-crf', '22',
+            '-profile:v', 'baseline',
+            '-level', '3.1',
+            '-crf', '23',
             '-preset', 'fast',
+            '-r', '30',
             '-c:a', 'aac',
             '-b:a', '128k',
-            '-movflags', 'faststart',
+            '-ac', '2',
+            '-movflags', '+faststart',
             '-y',
             output_file
         ]
-        
+
         logger.info(f"Запуск ffmpeg переобработки: {input_file} -> {output_file}")
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
+
         if result.returncode == 0:
             logger.info(f"✅ Видео успешно переобработано: {output_file}")
             return True
         else:
             logger.error(f"❌ Ошибка ffmpeg: {result.stderr}")
             return False
-            
+
     except Exception as e:
         logger.error(f"Ошибка при переобработке видео: {e}")
         return False
@@ -317,62 +378,65 @@ def get_channel_videos(url):
     return []
 
 def process_and_download(video_url, video_id):
+    """Скачивание и переобработка видео для Telegram."""
     cleanup_files(video_id)
     filename_template = f"{video_id}.%(ext)s"
     temp_file = f"{video_id}_temp.mp4"
     final_file = f"{video_id}.mp4"
-    
-    # Скачиваем видео как есть
+    thumb_file = f"{video_id}_thumb.jpg"
+
+    # Скачиваем видео как единый поток (без разбиения video+audio).
+    # TikTok отдаёт combined streams, разбиение через bestvideo+bestaudio
+    # ломает метаданные aspect ratio при мерже.
     ydl_opts = {
-        'format': 'bestvideo[height<=1080]+bestaudio/best', 
+        'format': 'best[height<=1080]/best',
         'outtmpl': filename_template,
-        'merge_output_format': 'mp4',
         'quiet': True,
         'noplaylist': True,
         'writethumbnail': False,
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(video_url, download=True)
-            
+
             if os.path.exists(final_file):
                 # Переименовываем в temp и переобрабатываем через ffmpeg
                 os.rename(final_file, temp_file)
-                
-                # Запускаем ffmpeg для стандартизации
+
                 if reprocess_video_ffmpeg(temp_file, final_file):
-                    # Удаляем временный файл если переобработка успешна
                     try:
                         os.remove(temp_file)
-                    except:
+                    except OSError:
                         pass
-                    
-                    raw_title = info.get('title', '') or info.get('description', '')
-                    clean_title = clean_hashtags(raw_title)
-                    author = info.get('uploader') or info.get('channel') or "TikTok"
-                    ts = info.get('timestamp')
-                    d_str = info.get('upload_date')
-                    final_date = format_timestamp(ts, d_str)
-                    
-                    return final_file, clean_title, final_date, author
                 else:
-                    # Если ffmpeg не сработал, пробуем отправить оригинальное видео
-                    logger.warning(f"ffmpeg не сработал, отправляем оригинальное видео {video_id}")
+                    # Если ffmpeg не сработал — используем оригинал
+                    logger.warning(
+                        f"ffmpeg не сработал, отправляем оригинальное видео {video_id}"
+                    )
                     os.rename(temp_file, final_file)
-                    
-                    raw_title = info.get('title', '') or info.get('description', '')
-                    clean_title = clean_hashtags(raw_title)
-                    author = info.get('uploader') or info.get('channel') or "TikTok"
-                    ts = info.get('timestamp')
-                    d_str = info.get('upload_date')
-                    final_date = format_timestamp(ts, d_str)
-                    
-                    return final_file, clean_title, final_date, author
-            
+
+                # Генерируем thumbnail из итогового файла
+                generate_thumbnail(final_file, thumb_file)
+
+                raw_title = info.get('title', '') or info.get('description', '')
+                clean_title = clean_hashtags(raw_title)
+                author = (
+                    info.get('uploader') or info.get('channel') or "TikTok"
+                )
+                ts = info.get('timestamp')
+                d_str = info.get('upload_date')
+                final_date = format_timestamp(ts, d_str)
+
+                return final_file, clean_title, final_date, author
+
         except Exception as e:
             logger.error(f"Ошибка обработки {video_url}: {e}")
-            
+
     return None, None, None, None
 
 # --- ОСНОВНОЙ ЦИКЛ ---
@@ -677,19 +741,27 @@ async def check_videos(bot: Bot, dp: Dispatcher):
                                 f"👤 Канал: <b>{author}</b>\n"
                                 f"Источник: <a href='{video_url}'>Видео</a>"
                             )
-                            
-                            # Достаем реальные размеры для корректного отображения на iOS
-                            w, h = await asyncio.to_thread(get_video_dimensions, file_path)
+
+                            # Размеры для корректного отображения на iOS
+                            w, h = await asyncio.to_thread(
+                                get_video_dimensions, file_path
+                            )
                             kwargs = {}
                             if w and h:
                                 kwargs['width'] = w
                                 kwargs['height'] = h
-                            
+
+                            # Thumbnail — критично для iOS aspect ratio
+                            thumb_path = f"{video_id}_thumb.jpg"
+                            if os.path.exists(thumb_path):
+                                kwargs['thumbnail'] = FSInputFile(thumb_path)
+
                             await bot.send_video(
-                                chat_id=CHANNEL_ID, 
-                                video=video_input, 
+                                chat_id=CHANNEL_ID,
+                                video=video_input,
                                 caption=caption,
                                 parse_mode="HTML",
+                                supports_streaming=True,
                                 **kwargs
                             )
                             
