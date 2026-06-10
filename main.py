@@ -73,6 +73,14 @@ def init_db():
             last_fail_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS account_failures (
+            url TEXT PRIMARY KEY,
+            consecutive_fails INTEGER DEFAULT 0,
+            notified INTEGER DEFAULT 0,
+            last_fail_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -129,6 +137,7 @@ def delete_account(url):
     conn = sqlite3.connect("videos.db")
     cursor = conn.cursor()
     cursor.execute("DELETE FROM tiktok_accounts WHERE url = ?", (url,))
+    cursor.execute("DELETE FROM account_failures WHERE url = ?", (url,))
     conn.commit()
     affected = cursor.rowcount
     conn.close()
@@ -154,6 +163,56 @@ def mark_video_failed(video_id):
             fail_count = fail_count + 1,
             last_fail_time = CURRENT_TIMESTAMP
     """, (video_id,))
+    conn.commit()
+    conn.close()
+
+
+def record_account_success(url):
+    """Сбросить счётчик неудач для аккаунта (видео найдены)."""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE account_failures SET consecutive_fails = 0, notified = 0 WHERE url = ?",
+        (url,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_account_failure(url):
+    """
+    Увеличить счётчик последовательных неудач для аккаунта.
+    Возвращает (consecutive_fails, already_notified).
+    """
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO account_failures (url, consecutive_fails, notified)
+        VALUES (?, 1, 0)
+        ON CONFLICT(url) DO UPDATE SET
+            consecutive_fails = consecutive_fails + 1,
+            last_fail_time = CURRENT_TIMESTAMP
+        """,
+        (url,),
+    )
+    conn.commit()
+    cursor.execute(
+        "SELECT consecutive_fails, notified FROM account_failures WHERE url = ?",
+        (url,),
+    )
+    row = cursor.fetchone()
+    conn.close()
+    return row if row else (0, 0)
+
+
+def mark_account_notified(url):
+    """Отметить, что уведомление об аккаунте уже отправлено."""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "UPDATE account_failures SET notified = 1 WHERE url = ?", (url,)
+    )
     conn.commit()
     conn.close()
 
@@ -232,107 +291,74 @@ def generate_thumbnail(video_file, thumb_file):
 
 def reprocess_video_ffmpeg(input_file, output_file):
     """
-    Переобработка видео через ffmpeg для совместимости с Telegram iOS.
-    
-    Ключевые параметры для iPhone:
-    - H.264 Baseline profile (максимальная совместимость с iOS-плеером)
-    - Level 3.1 (безопасный для всех мобильных устройств)
-    - yuv420p (единственный формат, который корректно воспроизводится везде)
-    - movflags +faststart (moov atom в начале файла для стриминга)
-    - setsar=1 + setdar (явные пропорции пикселей и дисплея)
+    Ремуксинг видео для совместимости с Telegram без потери качества.
+
+    Стратегия:
+    1. Копируем видео- и аудиопотоки без перекодирования (-c copy).
+    2. Устанавливаем movflags +faststart для быстрого стриминга.
+    3. Фиксим SAR=1 через bsf, чтобы Telegram/iOS корректно определял
+       пропорции.
+    4. Если copy-режим не сработал (редкий кодек), делаем минимальный
+       re-encode с максимальным качеством (CRF 17, preset slow).
     """
     try:
-        # Получаем информацию об исходном видео
-        probe_cmd = [
-            'ffprobe', '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height',
-            '-of', 'csv=p=0', input_file
+        # --- Попытка 1: Быстрый ремуксинг без перекодировки ---
+        cmd_copy = [
+            "ffmpeg",
+            "-i", input_file,
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            "-y",
+            output_file,
         ]
 
-        probe_result = subprocess.run(
-            probe_cmd, capture_output=True, text=True, timeout=30
+        logger.info(
+            f"Запуск ffmpeg ремуксинг (copy): {input_file} -> {output_file}"
+        )
+        result = subprocess.run(
+            cmd_copy, capture_output=True, text=True, timeout=120
         )
 
-        if probe_result.returncode == 0:
-            dimensions = probe_result.stdout.strip().split(',')
-            orig_w, orig_h = int(dimensions[0]), int(dimensions[1])
-            aspect_ratio = orig_w / orig_h if orig_h > 0 else 1
+        if result.returncode == 0 and os.path.exists(output_file):
+            logger.info(f"✅ Видео ремукснуто без потерь: {output_file}")
+            return True
 
-            logger.info(
-                f"Исходное видео: {orig_w}x{orig_h}, "
-                f"соотношение: {aspect_ratio:.4f}"
-            )
+        logger.warning(
+            f"Copy-режим не удался, пробуем минимальный re-encode: "
+            f"{result.stderr[:300]}"
+        )
 
-            target_ratio = 9 / 16  # 0.5625
-
-            if aspect_ratio > 0.65:
-                # Слишком широкое — обрезаем бока
-                logger.info("Видео слишком широкое, обрезаем бока")
-                new_w = int(orig_h * target_ratio)
-                # Делаем ширину чётной
-                new_w = new_w if new_w % 2 == 0 else new_w - 1
-                vf = (
-                    f"crop={new_w}:{orig_h},"
-                    f"scale=1080:1920,"
-                    f"setsar=1,setdar=9/16"
-                )
-            elif aspect_ratio < 0.4:
-                # Слишком узкое — чёрные полосы по бокам
-                logger.info("Видео слишком узкое, добавляем полосы")
-                vf = (
-                    "scale=1080:1920:"
-                    "force_original_aspect_ratio=decrease,"
-                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-                    "setsar=1,setdar=9/16"
-                )
-            else:
-                # Нормальное соотношение — масштабируем и выравниваем
-                logger.info("Соотношение сторон близко к 9:16")
-                vf = (
-                    "scale=1080:1920:"
-                    "force_original_aspect_ratio=decrease,"
-                    "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-                    "setsar=1,setdar=9/16"
-                )
-        else:
-            logger.warning(
-                "Не удалось получить размер видео, используем стандартный фильтр"
-            )
-            vf = (
-                "scale=1080:1920:"
-                "force_original_aspect_ratio=decrease,"
-                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,"
-                "setsar=1,setdar=9/16"
-            )
-
-        cmd = [
-            'ffmpeg', '-i', input_file,
-            '-vf', vf,
-            '-c:v', 'libx264',
-            '-pix_fmt', 'yuv420p',
-            '-profile:v', 'baseline',
-            '-level', '3.1',
-            '-crf', '23',
-            '-preset', 'fast',
-            '-r', '30',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-ac', '2',
-            '-movflags', '+faststart',
-            '-y',
-            output_file
+        # --- Попытка 2: Минимальный re-encode с сохранением качества ---
+        cmd_reencode = [
+            "ffmpeg",
+            "-i", input_file,
+            "-c:v", "libx264",
+            "-pix_fmt", "yuv420p",
+            "-crf", "17",
+            "-preset", "slow",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-y",
+            output_file,
         ]
 
-        logger.info(f"Запуск ffmpeg переобработки: {input_file} -> {output_file}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        logger.info(
+            f"Запуск ffmpeg re-encode (CRF 17): {input_file} -> {output_file}"
+        )
+        result = subprocess.run(
+            cmd_reencode, capture_output=True, text=True, timeout=600
+        )
 
         if result.returncode == 0:
-            logger.info(f"✅ Видео успешно переобработано: {output_file}")
+            logger.info(
+                f"✅ Видео переобработано с высоким качеством: {output_file}"
+            )
             return True
-        else:
-            logger.error(f"❌ Ошибка ffmpeg: {result.stderr}")
-            return False
+
+        logger.error(f"❌ Ошибка ffmpeg re-encode: {result.stderr}")
+        return False
 
     except Exception as e:
         logger.error(f"Ошибка при переобработке видео: {e}")
@@ -385,19 +411,21 @@ def process_and_download(video_url, video_id):
     final_file = f"{video_id}.mp4"
     thumb_file = f"{video_id}_thumb.jpg"
 
-    # Скачиваем видео как единый поток (без разбиения video+audio).
-    # TikTok отдаёт combined streams, разбиение через bestvideo+bestaudio
-    # ломает метаданные aspect ratio при мерже.
+    # Скачиваем видео в максимальном доступном качестве.
+    # bestvideo+bestaudio даёт лучшее качество, merge в mp4.
     ydl_opts = {
-        'format': 'best[height<=1080]/best',
-        'outtmpl': filename_template,
-        'quiet': True,
-        'noplaylist': True,
-        'writethumbnail': False,
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4',
-        }],
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": filename_template,
+        "quiet": True,
+        "noplaylist": True,
+        "writethumbnail": False,
+        "merge_output_format": "mp4",
+        "postprocessors": [
+            {
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }
+        ],
     }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -672,7 +700,7 @@ async def main():
         await handle_text_input(message)
     
     init_db()
-    logger.info("Бот запущен v7.4 (Shutdown Fix + UI Update)")
+    logger.info("Бот запущен v7.5 (Без сжатия качества + Уведомления о недоступных ссылках)")
     
     # Запускаем polling и основной цикл одновременно
     polling_task = asyncio.create_task(dp.start_polling(bot))
@@ -690,48 +718,98 @@ async def main():
         except asyncio.CancelledError:
             logger.info("Задача проверки видео остановлена.")
 
+async def notify_admin_account_down(bot: Bot, account_url: str):
+    """Отправить уведомление админу в ЛС о недоступной ссылке."""
+    username = account_url.replace("https://www.tiktok.com/@", "")
+    text = (
+        f"⚠️ <b>Ссылка недоступна</b>\n\n"
+        f"Аккаунт <a href='{account_url}'>@{username}</a> "
+        f"не отвечает 3 проверки подряд.\n\n"
+        f"Возможные причины:\n"
+        f"• Аккаунт заблокирован или удалён\n"
+        f"• Изменился URL\n"
+        f"• Временные проблемы TikTok\n\n"
+        f"Проверьте ссылку и удалите, если она больше не нужна."
+    )
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID, text=text, parse_mode="HTML"
+        )
+        logger.info(f"Уведомление админу: аккаунт {account_url} недоступен")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление админу: {e}")
+
+
 async def check_videos(bot: Bot, dp: Dispatcher):
     """Основной цикл скачивания видео"""
     try:
         while True:
-            accounts = await asyncio.to_thread(get_all_accounts)  # Получаем актуальный список
-            
+            accounts = await asyncio.to_thread(get_all_accounts)
+
             for account in accounts:
                 logger.info(f"Проверяем: {account}")
                 videos = await asyncio.to_thread(get_channel_videos, account)
-                
+
                 if not videos:
+                    # Отслеживаем последовательные неудачи получения списка
+                    fails, notified = await asyncio.to_thread(
+                        record_account_failure, account
+                    )
+                    logger.warning(
+                        f"Нет видео для {account} "
+                        f"(подряд неудач: {fails}, уведомлено: {notified})"
+                    )
+                    if fails >= 3 and not notified:
+                        await notify_admin_account_down(bot, account)
+                        await asyncio.to_thread(
+                            mark_account_notified, account
+                        )
                     continue
+
+                # Видео получены — сбрасываем счётчик неудач
+                await asyncio.to_thread(record_account_success, account)
 
                 videos_sorted = list(reversed(videos))
 
                 for entry in videos_sorted:
-                    video_id = entry.get('id')
-                    video_url = entry.get('url')
+                    video_id = entry.get("id")
+                    video_url = entry.get("url")
 
                     if not video_id or not video_url:
                         continue
 
                     if is_video_sent(video_id):
                         continue
-                    
+
                     # Пропускаем видео которые не скачиваются
                     if is_video_failed(video_id):
-                        logger.warning(f"Видео {video_id} не скачивается (более 3 попыток). Пропускаем.")
+                        logger.warning(
+                            f"Видео {video_id} не скачивается "
+                            f"(более 3 попыток). Пропускаем."
+                        )
                         continue
 
                     logger.info(f"Обрабатываю новое видео: {video_id}")
-                    
-                    file_path, title, date_str, author = await asyncio.to_thread(process_and_download, video_url, video_id)
-                    
+
+                    file_path, title, date_str, author = (
+                        await asyncio.to_thread(
+                            process_and_download, video_url, video_id
+                        )
+                    )
+
                     if file_path:
                         try:
-                            # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА (Fix HTTP 413 Error) ---
-                            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                            # --- ПРОВЕРКА РАЗМЕРА ФАЙЛА ---
+                            file_size_mb = os.path.getsize(file_path) / (
+                                1024 * 1024
+                            )
                             if file_size_mb > MAX_FILE_SIZE_MB:
-                                logger.warning(f"Файл {file_path} слишком большой ({file_size_mb:.2f} MB). Пропускаем.")
+                                logger.warning(
+                                    f"Файл {file_path} слишком большой "
+                                    f"({file_size_mb:.2f} MB). Пропускаем."
+                                )
                                 cleanup_files(video_id)
-                                mark_video_sent(video_id, account) 
+                                mark_video_sent(video_id, account)
                                 continue
 
                             video_input = FSInputFile(file_path)
@@ -748,13 +826,15 @@ async def check_videos(bot: Bot, dp: Dispatcher):
                             )
                             kwargs = {}
                             if w and h:
-                                kwargs['width'] = w
-                                kwargs['height'] = h
+                                kwargs["width"] = w
+                                kwargs["height"] = h
 
                             # Thumbnail — критично для iOS aspect ratio
                             thumb_path = f"{video_id}_thumb.jpg"
                             if os.path.exists(thumb_path):
-                                kwargs['thumbnail'] = FSInputFile(thumb_path)
+                                kwargs["thumbnail"] = FSInputFile(
+                                    thumb_path
+                                )
 
                             await bot.send_video(
                                 chat_id=CHANNEL_ID,
@@ -762,27 +842,32 @@ async def check_videos(bot: Bot, dp: Dispatcher):
                                 caption=caption,
                                 parse_mode="HTML",
                                 supports_streaming=True,
-                                **kwargs
+                                **kwargs,
                             )
-                            
+
                             mark_video_sent(video_id, account)
                             logger.info(f"Видео {video_id} отправлено.")
-                            
+
                         except exceptions.TelegramRetryAfter as e:
-                            logger.warning(f"Лимит Telegram. Ждем {e.retry_after} сек.")
+                            logger.warning(
+                                f"Лимит Telegram. Ждем {e.retry_after} сек."
+                            )
                             await asyncio.sleep(e.retry_after)
                             cleanup_files(video_id)
-                            continue 
+                            continue
                         except Exception as e:
                             logger.error(f"Ошибка отправки: {e}")
                         finally:
                             cleanup_files(video_id)
                             await asyncio.sleep(DELAY_BETWEEN_UPLOADS)
                     else:
-                        logger.error(f"Не удалось скачать видео {video_id}. Отмечаем как неудачное.")
+                        logger.error(
+                            f"Не удалось скачать видео {video_id}. "
+                            f"Отмечаем как неудачное."
+                        )
                         mark_video_failed(video_id)
                         cleanup_files(video_id)
-            
+
             logger.info(f"Пауза {CHECK_INTERVAL} сек.")
             await asyncio.sleep(CHECK_INTERVAL)
     except asyncio.CancelledError:
