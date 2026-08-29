@@ -393,6 +393,7 @@ def get_channel_videos(url):
         'quiet': True,
         'ignoreerrors': True,
         'impersonate': 'chrome',
+        'socket_timeout': 30,
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
@@ -422,6 +423,7 @@ def process_and_download(video_url, video_id):
         "writethumbnail": False,
         "merge_output_format": "mp4",
         "impersonate": "chrome",
+        "socket_timeout": 30,
         "postprocessors": [
             {
                 "key": "FFmpegVideoConvertor",
