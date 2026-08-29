@@ -392,11 +392,12 @@ def get_channel_videos(url):
         'extract_flat': True,
         'quiet': True,
         'ignoreerrors': True,
+        'impersonate': 'chrome',
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
-            if 'entries' in info:
+            if info and 'entries' in info:
                 return [x for x in info['entries'] if x is not None]
         except Exception as e:
             logger.error(f"Ошибка чтения канала {url}: {e}")
@@ -420,6 +421,7 @@ def process_and_download(video_url, video_id):
         "noplaylist": True,
         "writethumbnail": False,
         "merge_output_format": "mp4",
+        "impersonate": "chrome",
         "postprocessors": [
             {
                 "key": "FFmpegVideoConvertor",
