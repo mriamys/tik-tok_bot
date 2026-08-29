@@ -1,3 +1,4 @@
+import sys
 import logging
 import asyncio
 import os
@@ -389,7 +390,7 @@ def get_tiktok_avatar(username):
 
 def get_channel_videos(url):
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "--dump-json",
         "--flat-playlist",
         "--ignore-errors",
@@ -427,7 +428,7 @@ def process_and_download(video_url, video_id):
     thumb_file = f"{video_id}_thumb.jpg"
 
     cmd = [
-        "yt-dlp",
+        sys.executable, "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
         "-o", filename_template,
         "--merge-output-format", "mp4",
