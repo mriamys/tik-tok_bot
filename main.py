@@ -388,22 +388,35 @@ def get_tiktok_avatar(username):
     return None
 
 def get_channel_videos(url):
-    ydl_opts = {
-        'extract_flat': True,
-        'quiet': True,
-        'ignoreerrors': True,
-        'impersonate': 'chrome',
-        'socket_timeout': 30,
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if info and 'entries' in info:
-                return [x for x in info['entries'] if x is not None]
-        except Exception as e:
-            logger.error(f"Ошибка чтения канала {url}: {e}")
+    cmd = [
+        "yt-dlp",
+        "--dump-json",
+        "--flat-playlist",
+        "--ignore-errors",
+        "--quiet",
+        "--impersonate", "chrome",
+        url
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0 and not result.stdout.strip():
+            logger.error(f"Ошибка yt-dlp для {url}: {result.stderr}")
             return []
-    return []
+        
+        entries = []
+        for line in result.stdout.strip().split('\n'):
+            if line:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return entries
+    except subprocess.TimeoutExpired:
+        logger.error(f"Таймаут (30с) при получении видео для {url}")
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка выполнения yt-dlp для {url}: {e}")
+        return []
 
 def process_and_download(video_url, video_id):
     """Скачивание и переобработка видео для Telegram."""
@@ -413,61 +426,66 @@ def process_and_download(video_url, video_id):
     final_file = f"{video_id}.mp4"
     thumb_file = f"{video_id}_thumb.jpg"
 
-    # Скачиваем видео в максимальном доступном качестве.
-    # bestvideo+bestaudio даёт лучшее качество, merge в mp4.
-    ydl_opts = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": filename_template,
-        "quiet": True,
-        "noplaylist": True,
-        "writethumbnail": False,
-        "merge_output_format": "mp4",
-        "impersonate": "chrome",
-        "socket_timeout": 30,
-        "postprocessors": [
-            {
-                "key": "FFmpegVideoConvertor",
-                "preferedformat": "mp4",
-            }
-        ],
-    }
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo+bestaudio/best",
+        "-o", filename_template,
+        "--merge-output-format", "mp4",
+        "--quiet",
+        "--no-playlist",
+        "--impersonate", "chrome",
+        "--dump-json",
+        "--no-simulate",
+        video_url
+    ]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(video_url, download=True)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        info = {}
+        for line in result.stdout.strip().split('\n'):
+            if line.startswith('{'):
+                try:
+                    info = json.loads(line)
+                except json.JSONDecodeError:
+                    pass
 
-            if os.path.exists(final_file):
-                # Переименовываем в temp и переобрабатываем через ffmpeg
-                os.rename(final_file, temp_file)
+        if os.path.exists(final_file):
+            # Переименовываем в temp и переобрабатываем через ffmpeg
+            os.rename(final_file, temp_file)
 
-                if reprocess_video_ffmpeg(temp_file, final_file):
-                    try:
-                        os.remove(temp_file)
-                    except OSError:
-                        pass
-                else:
-                    # Если ffmpeg не сработал — используем оригинал
-                    logger.warning(
-                        f"ffmpeg не сработал, отправляем оригинальное видео {video_id}"
-                    )
-                    os.rename(temp_file, final_file)
-
-                # Генерируем thumbnail из итогового файла
-                generate_thumbnail(final_file, thumb_file)
-
-                raw_title = info.get('title', '') or info.get('description', '')
-                clean_title = clean_hashtags(raw_title)
-                author = (
-                    info.get('uploader') or info.get('channel') or "TikTok"
+            if reprocess_video_ffmpeg(temp_file, final_file):
+                try:
+                    os.remove(temp_file)
+                except OSError:
+                    pass
+            else:
+                # Если ffmpeg не сработал — используем оригинал
+                logger.warning(
+                    f"ffmpeg не сработал, отправляем оригинальное видео {video_id}"
                 )
-                ts = info.get('timestamp')
-                d_str = info.get('upload_date')
-                final_date = format_timestamp(ts, d_str)
+                os.rename(temp_file, final_file)
 
-                return final_file, clean_title, final_date, author
+            # Генерируем thumbnail из итогового файла
+            generate_thumbnail(final_file, thumb_file)
 
-        except Exception as e:
-            logger.error(f"Ошибка обработки {video_url}: {e}")
+            raw_title = info.get('title', '') or info.get('description', '')
+            clean_title = clean_hashtags(raw_title)
+            author = (
+                info.get('uploader') or info.get('channel') or "TikTok"
+            )
+            ts = info.get('timestamp')
+            d_str = info.get('upload_date')
+            final_date = format_timestamp(ts, d_str)
+
+            return final_file, clean_title, final_date, author
+        else:
+            logger.error(f"Файл {final_file} не был создан yt-dlp. Stderr: {result.stderr}")
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"Таймаут (300с) при скачивании видео {video_url}")
+    except Exception as e:
+        logger.error(f"Ошибка обработки {video_url}: {e}")
 
     return None, None, None, None
 
