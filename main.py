@@ -399,7 +399,7 @@ def get_channel_videos(url):
         url
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if result.returncode != 0 and not result.stdout.strip():
             logger.error(f"Ошибка yt-dlp для {url}: {result.stderr}")
             return []
@@ -413,7 +413,7 @@ def get_channel_videos(url):
                     pass
         return entries
     except subprocess.TimeoutExpired:
-        logger.error(f"Таймаут (30с) при получении видео для {url}")
+        logger.error(f"Таймаут (90с) при получении видео для {url}")
         return []
     except Exception as e:
         logger.error(f"Ошибка выполнения yt-dlp для {url}: {e}")
@@ -747,7 +747,7 @@ async def notify_admin_account_down(bot: Bot, account_url: str):
     text = (
         f"⚠️ <b>Ссылка недоступна</b>\n\n"
         f"Аккаунт <a href='{account_url}'>@{username}</a> "
-        f"не отвечает 3 проверки подряд.\n\n"
+        f"не отвечает 10 проверок подряд.\n\n"
         f"Возможные причины:\n"
         f"• Аккаунт заблокирован или удалён\n"
         f"• Изменился URL\n"
@@ -782,7 +782,7 @@ async def check_videos(bot: Bot, dp: Dispatcher):
                         f"Нет видео для {account} "
                         f"(подряд неудач: {fails}, уведомлено: {notified})"
                     )
-                    if fails >= 3 and not notified:
+                    if fails >= 10 and not notified:
                         await notify_admin_account_down(bot, account)
                         await asyncio.to_thread(
                             mark_account_notified, account
