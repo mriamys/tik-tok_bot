@@ -28,6 +28,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "723550550"))  # Ваш ID для упра�
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1800"))
 DELAY_BETWEEN_UPLOADS = int(os.getenv("DELAY_BETWEEN_UPLOADS", "20"))
 MAX_FILE_SIZE_MB = 49  # Лимит телеграма для ботов (оставляем запас 1 МБ)
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_cookies.txt")
 
 from logging.handlers import RotatingFileHandler
 
@@ -389,19 +390,20 @@ def get_tiktok_avatar(username):
     return None
 
 def get_channel_videos(url):
+    cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--dump-json",
         "--flat-playlist",
         "--ignore-errors",
         "--quiet",
-        "--impersonate", "chrome",
+        *cookies_args,
         url
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         if result.returncode != 0 and not result.stdout.strip():
-            logger.error(f"Ошибка yt-dlp для {url}: {result.stderr}")
+            logger.error(f"Ошибка yt-dlp для {url}: {result.stderr[:200]}")
             return []
         
         entries = []
@@ -427,6 +429,7 @@ def process_and_download(video_url, video_id):
     final_file = f"{video_id}.mp4"
     thumb_file = f"{video_id}_thumb.jpg"
 
+    cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
@@ -434,7 +437,7 @@ def process_and_download(video_url, video_id):
         "--merge-output-format", "mp4",
         "--quiet",
         "--no-playlist",
-        "--impersonate", "chrome",
+        *cookies_args,
         "--dump-json",
         "--no-simulate",
         video_url
