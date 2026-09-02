@@ -348,7 +348,7 @@ async def check_videos(bot: Bot):
                 if not videos:
                     fails, notified = await asyncio.to_thread(record_account_failure, account)
                     if fails >= 10 and not notified:
-                        await notify_admin_account_down(bot, account)
+                        # await notify_admin_account_down(bot, account)
                         await asyncio.to_thread(mark_account_notified, account)
                     continue
                 
