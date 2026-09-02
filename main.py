@@ -390,7 +390,7 @@ def get_tiktok_avatar(username):
     return None
 
 def get_channel_videos(url):
-    cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
+    cookies_args = ["--cookies", COOKIES_FILE, "--impersonate", "chrome"] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--dump-json",
@@ -429,7 +429,7 @@ def process_and_download(video_url, video_id):
     final_file = f"{video_id}.mp4"
     thumb_file = f"{video_id}_thumb.jpg"
 
-    cookies_args = ["--cookies", COOKIES_FILE] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
+    cookies_args = ["--cookies", COOKIES_FILE, "--impersonate", "chrome"] if os.path.exists(COOKIES_FILE) else ["--impersonate", "chrome"]
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "-f", "bestvideo+bestaudio/best",
