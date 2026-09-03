@@ -732,18 +732,20 @@ async def main():
     # Запускаем polling и основной цикл одновременно
     polling_task = asyncio.create_task(dp.start_polling(bot))
     video_check_task = asyncio.create_task(check_videos(bot, dp))
+    backup_task = asyncio.create_task(daily_db_backup(bot))
     
     try:
         # Ждем завершения polling (это произойдет при SIGINT/Ctrl+C)
         await polling_task
     finally:
         # Отменяем задачу проверки видео
-        logger.info("Останавливаем задачу проверки видео...")
+        logger.info("Останавливаем задачи...")
         video_check_task.cancel()
+        backup_task.cancel()
         try:
-            await video_check_task
+            await asyncio.gather(video_check_task, backup_task)
         except asyncio.CancelledError:
-            logger.info("Задача проверки видео остановлена.")
+            logger.info("Задачи остановлены.")
 
 async def notify_admin_account_down(bot: Bot, account_url: str):
     """Отправить уведомление админу в ЛС о недоступной ссылке."""
@@ -765,6 +767,47 @@ async def notify_admin_account_down(bot: Bot, account_url: str):
         logger.info(f"Уведомление админу: аккаунт {account_url} недоступен")
     except Exception as e:
         logger.error(f"Не удалось отправить уведомление админу: {e}")
+
+
+async def daily_db_backup(bot: Bot):
+    """Отправляет бэкап базы данных каждый день в 5 утра."""
+    from datetime import datetime, timedelta
+    import asyncio
+    try:
+        while True:
+            now = datetime.now()
+            # Устанавливаем время на 5:00 текущего дня
+            target_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
+            
+            # Если 5 утра уже прошло сегодня, планируем на завтра
+            if now >= target_time:
+                target_time += timedelta(days=1)
+                
+            sleep_seconds = (target_time - now).total_seconds()
+            logger.info(f"Запланирована отправка бэкапа БД через {sleep_seconds/3600:.2f} часов (в {target_time.strftime('%Y-%m-%d %H:%M:%S')})")
+            
+            await asyncio.sleep(sleep_seconds)
+            
+            # Отправка файла
+            db_path = "videos.db"
+            if os.path.exists(db_path):
+                try:
+                    document = FSInputFile(db_path)
+                    await bot.send_document(
+                        chat_id=ADMIN_ID,
+                        document=document,
+                        caption=f"📦 Ежедневный бэкап базы данных (5:00)\nДата: {datetime.now().strftime('%Y-%m-%d')}"
+                    )
+                    logger.info("Бэкап базы данных успешно отправлен админу.")
+                except Exception as e:
+                    logger.error(f"Ошибка при отправке бэкапа: {e}")
+            else:
+                logger.warning("Файл videos.db не найден для бэкапа.")
+                
+            # Пауза чтобы не сработать дважды за одну минуту
+            await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("Задача бэкапа остановлена.")
 
 
 async def check_videos(bot: Bot, dp: Dispatcher):
