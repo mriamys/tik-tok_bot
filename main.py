@@ -395,6 +395,7 @@ def get_channel_videos(url):
         sys.executable, "-m", "yt_dlp",
         "--dump-json",
         "--flat-playlist",
+        "--playlist-end", "30",
         "--ignore-errors",
         "--quiet",
         *cookies_args,
