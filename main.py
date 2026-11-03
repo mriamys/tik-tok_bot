@@ -66,7 +66,8 @@ def init_db():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS tiktok_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL
+            url TEXT UNIQUE NOT NULL,
+            full_scraped INTEGER DEFAULT 0
         )
     """)
     cursor.execute("""
@@ -84,6 +85,11 @@ def init_db():
             last_fail_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Миграция: проверяем наличие колонки full_scraped
+    cursor.execute("PRAGMA table_info(tiktok_accounts)")
+    columns = [row[1] for row in cursor.fetchall()]
+    if "full_scraped" not in columns:
+        cursor.execute("ALTER TABLE tiktok_accounts ADD COLUMN full_scraped INTEGER DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -102,14 +108,30 @@ def mark_video_sent(video_id, account_url):
     conn.commit()
     conn.close()
 
-def is_account_new(account_url):
-    """Проверяет, есть ли уже отправленные видео для этого аккаунта"""
+def is_account_fully_scraped(account_url):
+    """Проверяет, было ли выполнено полное сканирование всех видео профиля"""
     conn = sqlite3.connect("videos.db")
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM sent_videos WHERE account_url = ? LIMIT 1", (account_url,))
-    result = cursor.fetchone()
+    cursor.execute("SELECT full_scraped FROM tiktok_accounts WHERE url = ?", (account_url,))
+    row = cursor.fetchone()
     conn.close()
-    return result is None
+    return bool(row and row[0] == 1)
+
+def mark_account_fully_scraped(account_url):
+    """Отмечает аккаунт как полностью просканированный"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tiktok_accounts SET full_scraped = 1 WHERE url = ?", (account_url,))
+    conn.commit()
+    conn.close()
+
+def reset_all_accounts_for_rescan():
+    """Сбрасывает флаг полного сканирования для всех аккаунтов для тотальной перепроверки"""
+    conn = sqlite3.connect("videos.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE tiktok_accounts SET full_scraped = 0")
+    conn.commit()
+    conn.close()
 
 def get_all_accounts():
     """Получить все аккаунты из базы"""
@@ -136,7 +158,7 @@ def add_account(url):
     conn = sqlite3.connect("videos.db")
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO tiktok_accounts (url) VALUES (?)", (url,))
+        cursor.execute("INSERT INTO tiktok_accounts (url, full_scraped) VALUES (?, 0)", (url,))
         conn.commit()
         conn.close()
         return True
@@ -522,31 +544,31 @@ def download_tiktok_photos(video_url, video_id):
         logger.error(f"Ошибка загрузки фотопоста {video_id}: {e}")
         return None
 
-def get_channel_videos(url, is_new=False):
+def get_channel_videos(url, full_scan=False):
     """
     Получение списка видеороликов с канала.
-    Для регулярных проверок: ограничение плейлиста 30 видео (быстро, ~2-4 сек).
-    Для новых аккаунтов: считываем до 150 видеороликов с увеличенным таймаутом.
+    При обычном мониторинге (full_scan=False): считываем последние 30 видео (2-4 сек).
+    При первичном/полном сканировании (full_scan=True): считываем ВСЕ доступные видео без лимита.
     Используется curl_cffi impersonate Chrome, чтобы обойти блокировки TikTok без cookies.
     """
-    limit = 150 if is_new else 30
-    timeout_sec = 240 if is_new else 60
-
-    cookies_args = []
-    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
-        cookies_args = ["--cookies", COOKIES_FILE]
+    timeout_sec = 600 if full_scan else 60
 
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "--dump-json",
         "--flat-playlist",
-        "--playlist-end", str(limit),
         "--ignore-errors",
         "--quiet",
         "--impersonate", "chrome",
-        *cookies_args,
-        url
     ]
+    if not full_scan:
+        cmd.extend(["--playlist-end", "30"])
+
+    if os.path.exists(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
+        cmd.extend(["--cookies", COOKIES_FILE])
+
+    cmd.append(url)
+
     try:
         result = subprocess.run(
             cmd,
@@ -674,13 +696,14 @@ def process_and_download(video_url, video_id):
     return None
 
 # --- ЛОГИКА СКАЧИВАНИЯ И ОТПРАВКИ ПУБЛИКАЦИЙ ---
-async def process_single_account(bot: Bot, account: str, is_new: bool = False):
+async def process_single_account(bot: Bot, account: str, full_scan: bool = False):
     """
     Обработать один аккаунт:
     получить список видео, отфильтровать уже отправленные, скачать и отправить в канал.
+    При full_scan=True собираются абсолютно все видео аккаунта без ограничений.
     """
-    logger.info(f"Проверяем: {account} (новый={is_new})")
-    videos = await asyncio.to_thread(get_channel_videos, account, is_new)
+    logger.info(f"Проверяем: {account} (полный_скан={full_scan})")
+    videos = await asyncio.to_thread(get_channel_videos, account, full_scan)
 
     if not videos:
         fails, notified = await asyncio.to_thread(record_account_failure, account)
@@ -698,19 +721,27 @@ async def process_single_account(bot: Bot, account: str, is_new: bool = False):
     # Хронологический порядок: от старых к новым
     videos_sorted = list(reversed(videos))
 
+    # Выделяем только неотправленные и несбойные
+    new_entries = []
     for entry in videos_sorted:
         video_id = entry.get("id")
         video_url = entry.get("url")
-
         if not video_id or not video_url:
             continue
-
         if is_video_sent(video_id):
             continue
-
-        # Пропускаем видео, которые ранее не скачались 3+ раза
         if is_video_failed(video_id):
             continue
+        new_entries.append(entry)
+
+    if new_entries:
+        logger.info(f"Найдено новых публикаций для {account}: {len(new_entries)} из {len(videos)} обнаруженных")
+    else:
+        logger.info(f"Для {account} нет новых публикаций (всего на канале {len(videos)})")
+
+    for entry in new_entries:
+        video_id = entry.get("id")
+        video_url = entry.get("url")
 
         logger.info(f"Обрабатываю публикацию: {video_id}")
 
@@ -813,6 +844,10 @@ async def process_single_account(bot: Bot, account: str, is_new: bool = False):
             mark_video_failed(video_id)
             cleanup_files(video_id)
 
+    if full_scan:
+        await asyncio.to_thread(mark_account_fully_scraped, account)
+        logger.info(f"✅ Полное сканирование для {account} завершено.")
+
 async def check_videos(bot: Bot, dp: Dispatcher):
     """Основной периодический цикл проверки всех аккаунтов"""
     try:
@@ -820,8 +855,9 @@ async def check_videos(bot: Bot, dp: Dispatcher):
             accounts = await asyncio.to_thread(get_all_accounts)
 
             for account in accounts:
-                is_new = await asyncio.to_thread(is_account_new, account)
-                await process_single_account(bot, account, is_new=is_new)
+                is_scraped = await asyncio.to_thread(is_account_fully_scraped, account)
+                needs_full = not is_scraped
+                await process_single_account(bot, account, full_scan=needs_full)
 
             logger.info(f"Пауза {CHECK_INTERVAL} сек.")
             await asyncio.sleep(CHECK_INTERVAL)
@@ -865,7 +901,7 @@ async def daily_db_backup(bot: Bot):
 async def get_main_keyboard():
     kb = [
         [KeyboardButton(text="➕ Добавить ссылку"), KeyboardButton(text="📋 Список")],
-        [KeyboardButton(text="📊 Статистика")]
+        [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="🔄 Перепроверить всё")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -1017,6 +1053,16 @@ async def handle_text_input(message: Message):
         await message.answer(stats_text, parse_mode="HTML")
         return
 
+    if text == "🔄 Перепроверить всё" or text == "/rescan":
+        reset_all_accounts_for_rescan()
+        await message.answer(
+            "🔄 <b>Все аккаунты поставлены в очередь на полное сканирование!</b>\n\n"
+            "Бот проверит каждый профиль от самого первого видео до последнего и докачает всё, что пропустил.",
+            parse_mode="HTML"
+        )
+        logger.info("Администратор запустил тотальную перепроверку всех аккаунтов.")
+        return
+
     if text.startswith('/'):
         return
 
@@ -1026,10 +1072,10 @@ async def handle_text_input(message: Message):
     if add_account(text):
         await message.answer(
             f"✅ Ссылка добавлена: {text}\n"
-            "🚀 Запускаю скачивание последних публикаций в канал..."
+            "🚀 Запускаю полное сканирование профиля со всеми видео в канал..."
         )
-        logger.info(f"Добавлена новая ссылка: {text}. Запуск немедленной обработки...")
-        asyncio.create_task(process_single_account(message.bot, text, is_new=True))
+        logger.info(f"Добавлена новая ссылка: {text}. Запуск полного сканирования...")
+        asyncio.create_task(process_single_account(message.bot, text, full_scan=True))
     else:
         await message.answer(f"⚠️ Ссылка уже существует: {text}")
 
@@ -1066,6 +1112,17 @@ async def main():
         await message.answer("👋 Бот управления TikTok ссылками", reply_markup=await get_main_keyboard())
         await handle_manage_links(message)
 
+    @dp.message(Command("rescan"))
+    async def rescan_cmd(message: Message):
+        if message.from_user.id == ADMIN_ID:
+            reset_all_accounts_for_rescan()
+            await message.answer(
+                "🔄 <b>Все аккаунты поставлены в очередь на полное сканирование!</b>\n\n"
+                "Бот проверит каждый профиль от самого первого видео до последнего и докачает всё, что пропустил.",
+                parse_mode="HTML"
+            )
+            logger.info("Администратор запустил /rescan.")
+
     @dp.callback_query(lambda c: c.data.startswith("confirm_del_"))
     async def confirm_delete_callback(callback: CallbackQuery):
         await handle_confirm_delete(callback)
@@ -1089,7 +1146,7 @@ async def main():
         await handle_text_input(message)
 
     init_db()
-    logger.info("Бот запущен v8.0 (Impersonate Chrome + Фотопосты/карусели + Сжатие видео + Ускоренный опрос)")
+    logger.info("Бот запущен v8.1 (Тотальное сканирование всех видео профиля + Фотопосты + Сжатие + Impersonate Chrome)")
 
     polling_task = asyncio.create_task(dp.start_polling(bot))
     video_check_task = asyncio.create_task(check_videos(bot, dp))
