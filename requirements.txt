@@ -3,3 +3,5 @@ yt_dlp
 requests
 beautifulsoup4
 python-dotenv
+curl_cffi
+
