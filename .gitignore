@@ -17,4 +17,12 @@ patch.py
 test_*.py
 tiktok_cookies.txt*
 playwright_session.json
-
+.env
+*.cache
+*.log
+*.session
+*.db-wal
+*.db-shm
+bot_state*.json
+__pycache__/
+*.pyc
