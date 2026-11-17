@@ -35,6 +35,18 @@ DELAY_BETWEEN_UPLOADS = int(os.getenv("DELAY_BETWEEN_UPLOADS", "20"))
 MAX_FILE_SIZE_MB = 49  # Лимит Телеграма для ботов (50 МБ минус запас)
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tiktok_cookies.txt")
 
+# Блокировки для исключения параллельного дублирования скачиваний
+processing_accounts = set()
+_upload_lock = None
+
+
+def get_upload_lock():
+    """Ленивое создание asyncio.Lock для последовательного скачивания и отправки в канал."""
+    global _upload_lock
+    if _upload_lock is None:
+        _upload_lock = asyncio.Lock()
+    return _upload_lock
+
 # --- ЛОГИРОВАНИЕ ---
 log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 log_file = 'bot.log'
@@ -702,151 +714,165 @@ async def process_single_account(bot: Bot, account: str, full_scan: bool = False
     получить список видео, отфильтровать уже отправленные, скачать и отправить в канал.
     При full_scan=True собираются абсолютно все видео аккаунта без ограничений.
     """
-    logger.info(f"Проверяем: {account} (полный_скан={full_scan})")
-    videos = await asyncio.to_thread(get_channel_videos, account, full_scan)
-
-    if not videos:
-        fails, notified = await asyncio.to_thread(record_account_failure, account)
-        logger.warning(
-            f"Нет видео для {account} (подряд неудач: {fails}, уведомлено: {notified})"
-        )
-        if fails >= 10 and not notified:
-            await notify_admin_account_down(bot, account)
-            await asyncio.to_thread(mark_account_notified, account)
+    if account in processing_accounts:
+        logger.info(f"Аккаунт {account} уже обрабатывается в другой задаче, пропускаем дубль.")
         return
 
-    # Видео получены — сбрасываем счётчик неудач для аккаунта
-    await asyncio.to_thread(record_account_success, account)
+    processing_accounts.add(account)
+    try:
+        logger.info(f"Проверяем: {account} (полный_скан={full_scan})")
+        videos = await asyncio.to_thread(get_channel_videos, account, full_scan)
 
-    # Хронологический порядок: от старых к новым
-    videos_sorted = list(reversed(videos))
-
-    # Выделяем только неотправленные и несбойные
-    new_entries = []
-    for entry in videos_sorted:
-        video_id = entry.get("id")
-        video_url = entry.get("url")
-        if not video_id or not video_url:
-            continue
-        if is_video_sent(video_id):
-            continue
-        if is_video_failed(video_id):
-            continue
-        new_entries.append(entry)
-
-    if new_entries:
-        logger.info(f"Найдено новых публикаций для {account}: {len(new_entries)} из {len(videos)} обнаруженных")
-    else:
-        logger.info(f"Для {account} нет новых публикаций (всего на канале {len(videos)})")
-
-    for entry in new_entries:
-        video_id = entry.get("id")
-        video_url = entry.get("url")
-
-        logger.info(f"Обрабатываю публикацию: {video_id}")
-
-        result = await asyncio.to_thread(process_and_download, video_url, video_id)
-
-        if result:
-            post_type = result.get('type')
-            title = result.get('title', '')
-            date_str = result.get('date', '')
-            author = result.get('author', 'TikTok')
-
-            caption = (
-                f"📅 <b>{date_str}</b>\n"
-                f"{title}\n\n"
-                f"👤 Канал: <b>{author}</b>\n"
-                f"Источник: <a href='{video_url}'>TikTok</a>"
+        if not videos:
+            fails, notified = await asyncio.to_thread(record_account_failure, account)
+            logger.warning(
+                f"Нет видео для {account} (подряд неудач: {fails}, уведомлено: {notified})"
             )
+            if fails >= 10 and not notified:
+                await notify_admin_account_down(bot, account)
+                await asyncio.to_thread(mark_account_notified, account)
+            return
 
-            try:
-                if post_type == 'video':
-                    file_path = result.get('file_path')
-                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        # Видео получены — сбрасываем счётчик неудач для аккаунта
+        await asyncio.to_thread(record_account_success, account)
 
-                    if file_size_mb > MAX_FILE_SIZE_MB:
-                        logger.warning(
-                            f"Файл {file_path} ({file_size_mb:.2f} MB) превышает {MAX_FILE_SIZE_MB} MB. Сжимаем видео..."
-                        )
-                        compressed_file = f"{video_id}_comp.mp4"
-                        if compress_video_to_size(file_path, compressed_file, target_mb=45):
-                            try:
-                                os.remove(file_path)
-                            except OSError:
-                                pass
-                            file_path = compressed_file
-                            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                            logger.info(f"✅ Видео сжато до {file_size_mb:.2f} MB")
-                        else:
-                            logger.warning(f"Не удалось сжать {file_path}. Пропускаем.")
-                            cleanup_files(video_id)
-                            mark_video_sent(video_id, account)
-                            continue
+        # Хронологический порядок: от старых к новым
+        videos_sorted = list(reversed(videos))
 
-                    video_input = FSInputFile(file_path)
-                    w, h = await asyncio.to_thread(get_video_dimensions, file_path)
-                    kwargs = {}
-                    if w and h:
-                        kwargs["width"] = w
-                        kwargs["height"] = h
-
-                    thumb_path = f"{video_id}_thumb.jpg"
-                    if os.path.exists(thumb_path):
-                        kwargs["thumbnail"] = FSInputFile(thumb_path)
-
-                    await bot.send_video(
-                        chat_id=CHANNEL_ID,
-                        video=video_input,
-                        caption=caption,
-                        parse_mode="HTML",
-                        supports_streaming=True,
-                        **kwargs,
-                    )
-                    mark_video_sent(video_id, account)
-                    logger.info(f"Видео {video_id} отправлено.")
-
-                elif post_type == 'photos':
-                    images = result.get('images', [])
-                    if len(images) == 1:
-                        await bot.send_photo(
-                            chat_id=CHANNEL_ID,
-                            photo=FSInputFile(images[0]),
-                            caption=caption,
-                            parse_mode="HTML"
-                        )
-                    else:
-                        media = [
-                            InputMediaPhoto(
-                                media=FSInputFile(img),
-                                caption=caption if idx == 0 else None,
-                                parse_mode="HTML"
-                            )
-                            for idx, img in enumerate(images[:10])
-                        ]
-                        await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
-
-                    mark_video_sent(video_id, account)
-                    logger.info(f"Фотопост {video_id} отправлен.")
-
-            except exceptions.TelegramRetryAfter as e:
-                logger.warning(f"Лимит Telegram. Ждем {e.retry_after} сек.")
-                await asyncio.sleep(e.retry_after)
-                cleanup_files(video_id)
+        # Выделяем только неотправленные и несбойные
+        new_entries = []
+        for entry in videos_sorted:
+            video_id = entry.get("id")
+            video_url = entry.get("url")
+            if not video_id or not video_url:
                 continue
-            except Exception as e:
-                logger.error(f"Ошибка отправки публикации {video_id}: {e}")
-            finally:
-                cleanup_files(video_id)
-                await asyncio.sleep(DELAY_BETWEEN_UPLOADS)
-        else:
-            logger.error(f"Не удалось скачать публикацию {video_id}. Отмечаем как неудачную.")
-            mark_video_failed(video_id)
-            cleanup_files(video_id)
+            if is_video_sent(video_id):
+                continue
+            if is_video_failed(video_id):
+                continue
+            new_entries.append(entry)
 
-    if full_scan:
-        await asyncio.to_thread(mark_account_fully_scraped, account)
-        logger.info(f"✅ Полное сканирование для {account} завершено.")
+        if new_entries:
+            logger.info(f"Найдено новых публикаций для {account}: {len(new_entries)} из {len(videos)} обнаруженных")
+        else:
+            logger.info(f"Для {account} нет новых публикаций (всего на канале {len(videos)})")
+
+        upload_lock = get_upload_lock()
+        for entry in new_entries:
+            video_id = entry.get("id")
+            video_url = entry.get("url")
+
+            async with upload_lock:
+                # Повторная проверка под блокировкой исключает гонку и повторную отправку
+                if is_video_sent(video_id) or is_video_failed(video_id):
+                    continue
+
+                logger.info(f"Обрабатываю публикацию: {video_id}")
+
+                result = await asyncio.to_thread(process_and_download, video_url, video_id)
+
+                if result:
+                    post_type = result.get('type')
+                    title = result.get('title', '')
+                    date_str = result.get('date', '')
+                    author = result.get('author', 'TikTok')
+
+                    caption = (
+                        f"📅 <b>{date_str}</b>\n"
+                        f"{title}\n\n"
+                        f"👤 Канал: <b>{author}</b>\n"
+                        f"Источник: <a href='{video_url}'>TikTok</a>"
+                    )
+
+                    try:
+                        if post_type == 'video':
+                            file_path = result.get('file_path')
+                            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+                            if file_size_mb > MAX_FILE_SIZE_MB:
+                                logger.warning(
+                                    f"Файл {file_path} ({file_size_mb:.2f} MB) превышает {MAX_FILE_SIZE_MB} MB. Сжимаем видео..."
+                                )
+                                compressed_file = f"{video_id}_comp.mp4"
+                                if compress_video_to_size(file_path, compressed_file, target_mb=45):
+                                    try:
+                                        os.remove(file_path)
+                                    except OSError:
+                                        pass
+                                    file_path = compressed_file
+                                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                                    logger.info(f"✅ Видео сжато до {file_size_mb:.2f} MB")
+                                else:
+                                    logger.warning(f"Не удалось сжать {file_path}. Пропускаем.")
+                                    cleanup_files(video_id)
+                                    mark_video_sent(video_id, account)
+                                    continue
+
+                            video_input = FSInputFile(file_path)
+                            w, h = await asyncio.to_thread(get_video_dimensions, file_path)
+                            kwargs = {}
+                            if w and h:
+                                kwargs["width"] = w
+                                kwargs["height"] = h
+
+                            thumb_path = f"{video_id}_thumb.jpg"
+                            if os.path.exists(thumb_path):
+                                kwargs["thumbnail"] = FSInputFile(thumb_path)
+
+                            await bot.send_video(
+                                chat_id=CHANNEL_ID,
+                                video=video_input,
+                                caption=caption,
+                                parse_mode="HTML",
+                                supports_streaming=True,
+                                **kwargs,
+                            )
+                            mark_video_sent(video_id, account)
+                            logger.info(f"Видео {video_id} отправлено.")
+
+                        elif post_type == 'photos':
+                            images = result.get('images', [])
+                            if len(images) == 1:
+                                await bot.send_photo(
+                                    chat_id=CHANNEL_ID,
+                                    photo=FSInputFile(images[0]),
+                                    caption=caption,
+                                    parse_mode="HTML"
+                                )
+                            else:
+                                media = [
+                                    InputMediaPhoto(
+                                        media=FSInputFile(img),
+                                        caption=caption if idx == 0 else None,
+                                        parse_mode="HTML"
+                                    )
+                                    for idx, img in enumerate(images[:10])
+                                ]
+                                await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+
+                            mark_video_sent(video_id, account)
+                            logger.info(f"Фотопост {video_id} отправлен.")
+
+                    except exceptions.TelegramRetryAfter as e:
+                        logger.warning(f"Лимит Telegram. Ждем {e.retry_after} сек.")
+                        await asyncio.sleep(e.retry_after)
+                        cleanup_files(video_id)
+                        continue
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки публикации {video_id}: {e}")
+                    finally:
+                        cleanup_files(video_id)
+                        await asyncio.sleep(DELAY_BETWEEN_UPLOADS)
+                else:
+                    logger.error(f"Не удалось скачать публикацию {video_id}. Отмечаем как неудачную.")
+                    mark_video_failed(video_id)
+                    cleanup_files(video_id)
+
+        if full_scan:
+            await asyncio.to_thread(mark_account_fully_scraped, account)
+            logger.info(f"✅ Полное сканирование для {account} завершено.")
+    finally:
+        processing_accounts.discard(account)
 
 async def check_videos(bot: Bot, dp: Dispatcher):
     """Основной периодический цикл проверки всех аккаунтов"""
@@ -1068,6 +1094,8 @@ async def handle_text_input(message: Message):
 
     if not text.startswith('https://www.tiktok.com/@'):
         return
+
+    text = text.split('?')[0].rstrip('/')
 
     if add_account(text):
         await message.answer(
